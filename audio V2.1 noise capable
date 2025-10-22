@@ -1,0 +1,176 @@
+`timescale 1ns / 1ps
+module audio_passthrough(
+    input        clk,        // FPGA 主时钟 50MHz
+    input        rst_n,      // 异步复位，低有效
+    input        btn_n,      // 按键低有效
+
+    // SPI型 ADC 接口
+    output reg   ADC_RSTN,   // 复位输出
+    output reg   ADC_CS,     // 片选输出
+    output reg   ADC_SCK,    // SPI 时钟输出
+    input        ADC_MISO,   // SPI 数据输入
+
+    // PWM 输出
+    output reg   AUDIO_PWM,
+
+    // LED 指示灯
+    output reg [7:0] LED_ALL
+);
+
+    // -----------------------------
+    // 参数
+    // -----------------------------
+    parameter CLK_FREQ = 50_000_000; // FPGA 主时钟
+    parameter RESET_US = 300;        // ADC 复位时间 0.3ms
+    parameter WAIT_US  = 10_000;     // 复位完成等待 10ms
+    parameter SCK_FREQ = 1_000_000;  // SPI SCK <= 5MHz
+
+    // -----------------------------
+    // 按键
+    // -----------------------------
+    wire enable = ~btn_n; // 按下有效
+
+    // -----------------------------
+    // ADC 初始化状态机
+    // -----------------------------
+    reg [23:0] reset_cnt;
+    reg init_done;
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            ADC_RSTN <= 0;
+            reset_cnt <= 0;
+            init_done <= 0;
+        end else if (!init_done) begin
+            if (reset_cnt < (CLK_FREQ/1_000_000)*RESET_US) begin
+                ADC_RSTN <= 0;
+                reset_cnt <= reset_cnt + 1;
+            end else if (reset_cnt < (CLK_FREQ/1_000_000)*(RESET_US + WAIT_US)) begin
+                ADC_RSTN <= 1;
+                reset_cnt <= reset_cnt + 1;
+            end else begin
+                init_done <= 1;
+            end
+        end
+    end
+
+    // -----------------------------
+    // SPI 采样状态机
+    // -----------------------------
+    reg [3:0] spi_bit_cnt;
+    reg [15:0] shift_reg;
+    reg [15:0] audio_sample;
+    reg [15:0] pwm_cnt;
+    reg [15:0] signal_prev;
+    reg [23:0] led2_timer;
+    reg led2_flash;
+
+    // 产生 SPI SCK 时钟
+    reg [5:0] sck_div;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            sck_div <= 0;
+            ADC_SCK <= 0;
+        end else if (init_done && enable) begin
+            if (sck_div >= (CLK_FREQ/(2*SCK_FREQ)-1)) begin
+                sck_div <= 0;
+                ADC_SCK <= ~ADC_SCK;
+            end else begin
+                sck_div <= sck_div + 1;
+            end
+        end else begin
+            ADC_SCK <= 0;
+            sck_div <= 0;
+        end
+    end
+
+    // SPI 读 ADC 数据
+    reg spi_busy;
+    reg cs_reg;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            spi_bit_cnt <= 0;
+            shift_reg <= 0;
+            audio_sample <= 0;
+            ADC_CS <= 1;
+            spi_busy <= 0;
+        end else if (init_done && enable) begin
+            if (!spi_busy) begin
+                // 启动一次 SPI
+                ADC_CS <= 0;
+                spi_busy <= 1;
+                spi_bit_cnt <= 0;
+            end else begin
+                // SPI 传输，每个 SCK 上升沿采样 MISO
+                if (ADC_SCK) begin
+                    shift_reg <= {shift_reg[14:0], ADC_MISO};
+                    spi_bit_cnt <= spi_bit_cnt + 1;
+                    if (spi_bit_cnt == 11) begin
+                        audio_sample <= {shift_reg[14:0], ADC_MISO};
+                        ADC_CS <= 1;
+                        spi_busy <= 0;
+                    end
+                end
+            end
+        end else begin
+            ADC_CS <= 1;
+            spi_busy <= 0;
+        end
+    end
+
+    // -----------------------------
+    // 信号检测与 LED2 闪烁
+    // -----------------------------
+    wire [15:0] diff = (audio_sample > signal_prev) ? (audio_sample - signal_prev) : (signal_prev - audio_sample);
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            signal_prev <= 0;
+            led2_timer <= 0;
+            led2_flash <= 0;
+        end else begin
+            signal_prev <= audio_sample;
+            if (diff > 16'd2) begin
+                led2_timer <= CLK_FREQ/4; // 闪烁约 0.25s
+                led2_flash <= 1;
+            end else if (led2_timer > 0) begin
+                led2_timer <= led2_timer - 1;
+            end else begin
+                led2_flash <= 0;
+            end
+        end
+    end
+
+    // -----------------------------
+    // PWM 输出
+    // -----------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            pwm_cnt <= 0;
+            AUDIO_PWM <= 0;
+        end else begin
+            pwm_cnt <= pwm_cnt + 1;
+            if (enable)
+                AUDIO_PWM <= (audio_sample > pwm_cnt);
+            else
+                AUDIO_PWM <= 0;
+        end
+    end
+
+    // -----------------------------
+    // LED 控制
+    // -----------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            LED_ALL <= 8'b0000_0000;
+        end else begin
+            LED_ALL[0] <= enable;        // LED1：按键启动
+            LED_ALL[1] <= led2_flash;    // LED2：音频信号闪烁
+            LED_ALL[2] <= ADC_CS;        // LED3：ADC CS
+            LED_ALL[3] <= ADC_SCK;       // LED4：ADC SCK
+            LED_ALL[4] <= ADC_MISO;      // LED5：ADC MISO
+            LED_ALL[7:5] <= 3'b000;      // 其余灭
+        end
+    end
+
+endmodule
