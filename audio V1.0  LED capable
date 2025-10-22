@@ -1,0 +1,85 @@
+`timescale 1ns / 1ps
+module audio_passthrough(
+    input        clk,         // FPGA 主时钟
+    input        rst_n,       // 异步复位（低有效）
+    input        btn_n,       // 按键输入（低有效）
+
+    // SPI型 ADC 接口
+    input        ADC_CS,      // 片选（低有效）
+    input        ADC_SCK,     // 串行时钟
+    input        ADC_MISO,    // 串行数据输出
+    input        ADC_RSTN,    // ADC复位输入（暂不使用）
+
+    // PWM 输出
+    output reg   AUDIO_PWM,
+
+    // LED 指示灯
+    output reg [7:0] LED_ALL  // 其他LED统一控制
+);
+
+    // -----------------------------
+    // 按键控制逻辑
+    // -----------------------------
+    wire enable = ~btn_n; // 按下为1，启动透传
+
+    // -----------------------------
+    // 串转并 (Serial to Parallel)
+    // -----------------------------
+    reg [15:0] shift_reg;
+    reg [4:0]  bit_cnt;
+    reg [15:0] audio_sample;
+    reg        pcm_ready;
+
+    always @(posedge ADC_SCK or negedge rst_n) begin
+        if (!rst_n) begin
+            bit_cnt     <= 0;
+            shift_reg   <= 0;
+            pcm_ready   <= 0;
+        end else if (!ADC_CS) begin
+            shift_reg <= {shift_reg[14:0], ADC_MISO};
+            bit_cnt   <= bit_cnt + 1;
+            pcm_ready <= 0;
+
+            if (bit_cnt == 15) begin
+                audio_sample <= {shift_reg[14:0], ADC_MISO};
+                pcm_ready <= 1;
+                bit_cnt <= 0;
+            end
+        end else begin
+            bit_cnt <= 0;
+            pcm_ready <= 0;
+        end
+    end
+
+    // -----------------------------
+    // PWM 输出与 LED 控制
+    // -----------------------------
+    reg [15:0] pwm_cnt;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pwm_cnt <= 0;
+            AUDIO_PWM <= 0;
+            LED_ALL <= 8'b00000000;
+        end else begin
+            pwm_cnt <= pwm_cnt + 1;
+
+            // 控制指示灯与其他LED
+            if (enable) begin
+               
+                LED_ALL <= 8'b00000001;  // 仅亮第一个LED
+            end else begin
+              
+                LED_ALL <= 8'b00000000;  // 全灭
+            end
+
+            // 音频PWM
+            if (enable && pcm_ready) begin
+                AUDIO_PWM <= (audio_sample > pwm_cnt);
+            end else begin
+                AUDIO_PWM <= 0; // 静音
+            end
+        end
+    end
+
+endmodule
