@@ -1,0 +1,224 @@
+`timescale 1ns / 1ps
+module audio_passthrough(
+    input        clk,        // FPGA 主时钟 50MHz
+    input        rst_n,      // 异步复位，低有效
+    input        btn_n,      // 按键低有效
+
+    // SPI型 ADC 接口
+    output reg   ADC_RSTN,   // 复位输出
+    output reg   ADC_CS,     // 片选输出
+    output reg   ADC_SCK,    // SPI 时钟输出
+    input        ADC_MISO,   // SPI 数据输入
+
+    // PWM 输出
+    output reg   AUDIO_PWM,
+
+    // LED 指示灯
+    output reg [7:0] LED_ALL
+);
+
+    // -----------------------------
+    // 1. 参数定义（新增滤波参数）
+    // -----------------------------
+    parameter CLK_FREQ     = 50_000_000; // FPGA 主时钟
+    parameter RESET_US     = 300;        // ADC 复位时间 0.3ms
+    parameter WAIT_US      = 10_000;     // 复位完成等待 10ms
+    parameter SCK_FREQ     = 1_000_000;  // SPI SCK <= 5MHz
+    parameter SAMPLE_FREQ  = 10_000;     // ADC 采样频率（由SPI速率推导）
+    parameter CUTOFF_FREQ  = 100;        // 高通滤波截止频率（100Hz，滤除低频噪声）
+    parameter Q15_SCALE    = 16'd65536;  // Q15格式缩放系数（2^15）
+
+    // 计算1阶IIR高通滤波系数（Q15格式，避免浮点运算）
+    wire [15:0] alpha; 
+    assign alpha = 16'd1 + (2 * 3.1416 * CUTOFF_FREQ * Q15_SCALE) / (SAMPLE_FREQ);
+    // 推导过程：alpha = 1/(1 + Fs/(2πFc)) → 优化为定点计算，确保系数在Q15范围内
+
+    // -----------------------------
+    // 2. 按键与使能信号
+    // -----------------------------
+    wire enable = ~btn_n; // 按下有效（启动音频透传）
+
+    // -----------------------------
+    // 3. ADC 初始化状态机（保持不变）
+    // -----------------------------
+    reg [23:0] reset_cnt;
+    reg init_done;
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            ADC_RSTN <= 0;
+            reset_cnt <= 0;
+            init_done <= 0;
+        end else if (!init_done) begin
+            if (reset_cnt < (CLK_FREQ/1_000_000)*RESET_US) begin
+                ADC_RSTN <= 0;
+                reset_cnt <= reset_cnt + 1;
+            end else if (reset_cnt < (CLK_FREQ/1_000_000)*(RESET_US + WAIT_US)) begin
+                ADC_RSTN <= 1;
+                reset_cnt <= reset_cnt + 1;
+            end else begin
+                init_done <= 1;
+            end
+        end
+    end
+
+    // -----------------------------
+    // 4. SPI 采样状态机（保持不变，新增采样有效标志）
+    // -----------------------------
+    reg [3:0] spi_bit_cnt;
+    reg [15:0] shift_reg;
+    reg [15:0] audio_sample;  // ADC原始采样值
+    reg spi_sample_valid;     // 采样完成标志（用于触发滤波）
+
+    // 产生 SPI SCK 时钟
+    reg [5:0] sck_div;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            sck_div <= 0;
+            ADC_SCK <= 0;
+        end else if (init_done && enable) begin
+            if (sck_div >= (CLK_FREQ/(2*SCK_FREQ)-1)) begin
+                sck_div <= 0;
+                ADC_SCK <= ~ADC_SCK;
+            end else begin
+                sck_div <= sck_div + 1;
+            end
+        end else begin
+            ADC_SCK <= 0;
+            sck_div <= 0;
+        end
+    end
+
+    // SPI 读 ADC 数据（新增采样有效标志）
+    reg spi_busy;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            spi_bit_cnt <= 0;
+            shift_reg <= 0;
+            audio_sample <= 0;
+            ADC_CS <= 1;
+            spi_busy <= 0;
+            spi_sample_valid <= 0;
+        end else if (init_done && enable) begin
+            spi_sample_valid <= 0; // 默认无效
+            if (!spi_busy) begin
+                // 启动一次 SPI 采样
+                ADC_CS <= 0;
+                spi_busy <= 1;
+                spi_bit_cnt <= 0;
+            end else begin
+                // SPI 传输：每个 SCK 上升沿采样 MISO（12位ADC，取高12位）
+                if (ADC_SCK) begin
+                    shift_reg <= {shift_reg[14:0], ADC_MISO};
+                    spi_bit_cnt <= spi_bit_cnt + 1;
+                    if (spi_bit_cnt == 11) begin // 12位采样完成
+                        audio_sample <= {4'b0000, shift_reg[14:3]}; // 对齐16位，丢弃低3位噪声
+                        ADC_CS <= 1;
+                        spi_busy <= 0;
+                        spi_sample_valid <= 1; // 标记采样完成，触发滤波
+                    end
+                end
+            end
+        end else begin
+            ADC_CS <= 1;
+            spi_busy <= 0;
+            spi_sample_valid <= 0;
+        end
+    end
+
+    // -----------------------------
+    // 5. 新增：1阶IIR高通滤波模块（核心降噪逻辑）
+    // -----------------------------
+    reg [15:0] filtered_sample; // 滤波后音频数据
+    reg [15:0] x_prev;          // 上一时刻原始采样值（x[n-1]）
+    reg [15:0] y_prev;          // 上一时刻滤波结果（y[n-1]）
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            filtered_sample <= 16'd0;
+            x_prev <= 16'd0;
+            y_prev <= 16'd0;
+        end else if (init_done && enable && spi_sample_valid) begin
+            // 1阶IIR高通滤波公式（定点实现，避免溢出）
+            // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+            // alpha：滤波系数（Q15格式），x：原始采样，y：滤波结果
+            reg [31:0] temp; // 临时变量，避免乘法溢出
+            
+            // 计算 (y[n-1] + x[n] - x[n-1])，确保符号正确
+            reg [15:0] diff;
+            diff = (audio_sample > x_prev) ? (audio_sample - x_prev) : (x_prev - audio_sample);
+            reg [15:0] sum = y_prev + diff;
+
+            // 系数乘法（Q15格式，结果右移15位还原）
+            temp = $signed(alpha) * $signed(sum);
+            filtered_sample = temp >>> 15; // 右移15位，保持16位精度
+
+            // 更新历史值，用于下一周期计算
+            x_prev <= audio_sample;
+            y_prev <= filtered_sample;
+        end
+    end
+
+    // -----------------------------
+    // 6. PWM 输出（改用滤波后的数据，优化噪声）
+    // -----------------------------
+    reg [15:0] pwm_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            pwm_cnt <= 0;
+            AUDIO_PWM <= 0;
+        end else begin
+            pwm_cnt <= pwm_cnt + 1;
+            // 对比滤波后的数据与PWM计数器，生成占空比信号
+            if (enable)
+                AUDIO_PWM <= (filtered_sample > pwm_cnt) ? 1'b1 : 1'b0;
+            else
+                AUDIO_PWM <= 1'b0;
+        end
+    end
+
+    // -----------------------------
+    // 7. LED 控制（新增滤波状态指示）
+    // -----------------------------
+    reg [15:0] signal_prev;     // 用于信号变化检测
+    reg [23:0] led2_timer;      // LED2闪烁计时器
+    reg led2_flash;             // LED2闪烁标志
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            signal_prev <= 0;
+            led2_timer <= 0;
+            led2_flash <= 0;
+            LED_ALL <= 8'b0000_0000;
+        end else begin
+            // 检测滤波后信号的变化（避免原始信号噪声误触发）
+            reg [15:0] signal_diff;
+            signal_diff = (filtered_sample > signal_prev) ? 
+                          (filtered_sample - signal_prev) : (signal_prev - filtered_sample);
+            
+            // LED2：有音频信号时闪烁（0.25秒）
+            if (signal_diff > 16'd5) begin // 阈值：避免微小噪声触发
+                led2_timer <= CLK_FREQ/4;  // 0.25秒计时
+                led2_flash <= 1;
+            end else if (led2_timer > 0) begin
+                led2_timer <= led2_timer - 1;
+            end else begin
+                led2_flash <= 0;
+            end
+
+            // 更新信号历史值
+            signal_prev <= filtered_sample;
+
+            // LED状态分配
+            LED_ALL[0] <= enable;        // LED1：按键启动指示（亮=工作）
+            LED_ALL[1] <= led2_flash;    // LED2：音频信号指示（闪=有信号）
+            LED_ALL[2] <= ADC_CS;        // LED3：ADC片选指示（灭=采样中）
+            LED_ALL[3] <= ADC_SCK;       // LED4：ADC时钟指示（闪=时钟正常）
+            LED_ALL[4] <= init_done;     // LED5：初始化完成指示（亮=就绪）
+            LED_ALL[5] <= spi_sample_valid; // LED6：采样完成指示（闪=采样正常）
+            LED_ALL[6] <= (filtered_sample > 16'd100); // LED7：滤波有效指示（亮=有有效信号）
+            LED_ALL[7] <= 1'b0;          // LED8：预留
+        end
+    end
+
+endmodule
