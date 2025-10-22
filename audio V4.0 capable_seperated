@@ -22,6 +22,15 @@ module top(
         .ADC_RSTN(ADC_RSTN), .ADC_CS(ADC_CS), .ADC_SCK(ADC_SCK), .ADC_MISO(ADC_MISO),
         .audio_sample(audio_sample), .enable(enable)
     );
+    
+    // 占位处理模块
+    audio_process u_proc (
+        .clk(clk), .rst_n(rst_n),
+        .enable(enable),
+        .audio_in(audio_sample),
+        .audio_out(audio_proc)
+    );
+
 
     audio_output u_output (
         .clk(clk), .rst_n(rst_n), .enable(enable),
@@ -109,6 +118,37 @@ module audio_input(
     end
 
 endmodule
+
+NOISE_PROC MODULE：
+`timescale 1ns / 1ps
+module audio_process(
+    input             clk,
+    input             rst_n,
+    input             enable,           // 按键启动
+    input      [15:0] audio_in,         // 输入音频（16位）
+    output reg [15:0] audio_out         // 输出音频（16位）
+);
+
+    // -----------------------------
+    // 占位寄存器（可用于滤波/降噪/增益）
+    // -----------------------------
+    reg [15:0] sample_buf;
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            sample_buf <= 16'd0;
+            audio_out <= 16'd0;
+        end else if(enable) begin
+            // 当前直接透传
+            sample_buf <= audio_in;
+            audio_out <= sample_buf;
+        end else begin
+            audio_out <= 16'd0;
+        end
+    end
+
+endmodule
+
 
 OUTPUT MODILE:
 `timescale 1ns / 1ps
