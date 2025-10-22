@@ -1,0 +1,168 @@
+TOP MODULE:
+`timescale 1ns / 1ps
+module top(
+    input clk,
+    input rst_n,
+    input btn_n,
+    // ADC SPI
+    output ADC_RSTN,
+    output ADC_CS,
+    output ADC_SCK,
+    input ADC_MISO,
+    // PWM 输出
+    output AUDIO_PWM,
+    output [7:0] LED_ALL
+);
+
+    wire [15:0] audio_sample;
+    wire enable;
+
+    audio_input u_input (
+        .clk(clk), .rst_n(rst_n), .btn_n(btn_n),
+        .ADC_RSTN(ADC_RSTN), .ADC_CS(ADC_CS), .ADC_SCK(ADC_SCK), .ADC_MISO(ADC_MISO),
+        .audio_sample(audio_sample), .enable(enable)
+    );
+
+    audio_output u_output (
+        .clk(clk), .rst_n(rst_n), .enable(enable),
+        .audio_sample(audio_sample),
+        .ADC_CS(ADC_CS), .ADC_SCK(ADC_SCK),
+        .AUDIO_PWM(AUDIO_PWM),
+        .LED_ALL(LED_ALL)
+    );
+
+endmodule
+
+INPUT MODULE:
+`timescale 1ns / 1ps
+module audio_input(
+    input        clk,
+    input        rst_n,
+    input        btn_n,
+    output reg   ADC_RSTN,
+    output reg   ADC_CS,
+    output reg   ADC_SCK,
+    input        ADC_MISO,
+    output reg [15:0] audio_sample,
+    output wire enable
+);
+
+    parameter CLK_FREQ = 50_000_000;
+    parameter RESET_US = 300;
+    parameter WAIT_US  = 10_000;
+    parameter SCK_FREQ = 1_000_000;
+
+    assign enable = ~btn_n;
+
+    // ---------------- ADC 初始化 ----------------
+    reg [23:0] reset_cnt;
+    reg init_done;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            ADC_RSTN <= 0; reset_cnt <= 0; init_done <= 0;
+        end else if(!init_done) begin
+            if(reset_cnt < (CLK_FREQ/1_000_000)*RESET_US) ADC_RSTN <= 0;
+            else if(reset_cnt < (CLK_FREQ/1_000_000)*(RESET_US+WAIT_US)) ADC_RSTN <= 1;
+            else init_done <= 1;
+            reset_cnt <= reset_cnt + 1;
+        end
+    end
+
+    // ---------------- SPI SCK ----------------
+    reg [5:0] sck_div;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin ADC_SCK <= 0; sck_div <= 0; end
+        else if(init_done && enable) begin
+            if(sck_div >= (CLK_FREQ/(2*SCK_FREQ)-1)) begin
+                sck_div <= 0; ADC_SCK <= ~ADC_SCK;
+            end else sck_div <= sck_div + 1;
+        end else begin ADC_SCK <= 0; sck_div <= 0; end
+    end
+
+    // ---------------- SPI 采样 ----------------
+    reg [3:0] spi_bit_cnt;
+    reg [15:0] shift_reg;
+    reg spi_busy;
+    reg [15:0] audio_sample_raw;
+
+    always @(posedge ADC_SCK or negedge rst_n) begin
+        if(!rst_n) begin
+            shift_reg <= 0; audio_sample_raw <= 0; spi_bit_cnt <= 0;
+            ADC_CS <= 1; spi_busy <= 0;
+        end else if(init_done && enable) begin
+            if(!spi_busy) begin ADC_CS <= 0; spi_busy <= 1; spi_bit_cnt <= 0; end
+            else begin
+                shift_reg <= {shift_reg[14:0], ADC_MISO};
+                spi_bit_cnt <= spi_bit_cnt + 1;
+                if(spi_bit_cnt == 11) begin
+                    audio_sample_raw <= {shift_reg[14:0], ADC_MISO};
+                    ADC_CS <= 1; spi_busy <= 0;
+                end
+            end
+        end else begin ADC_CS <= 1; spi_busy <= 0; end
+    end
+
+    // ---------------- 音频缓冲 ----------------
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) audio_sample <= 0;
+        else audio_sample <= audio_sample_raw << 2; // 左移放大
+    end
+
+endmodule
+
+OUTPUT MODILE:
+`timescale 1ns / 1ps
+module audio_output(
+    input clk,
+    input rst_n,
+    input enable,
+    input [15:0] audio_sample,
+    input ADC_CS,
+    input ADC_SCK,
+    output reg AUDIO_PWM,
+    output reg [7:0] LED_ALL
+);
+
+    parameter CLK_FREQ = 50_000_000;
+    parameter PWM_FREQ = 500_000;
+
+    // ---------------- PWM ----------------
+    reg [15:0] pwm_cnt;
+    reg [15:0] pwm_max;
+    initial pwm_max = CLK_FREQ / PWM_FREQ;
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin pwm_cnt <= 0; AUDIO_PWM <= 0; end
+        else begin
+            if(pwm_cnt >= pwm_max-1) pwm_cnt <= 0;
+            else pwm_cnt <= pwm_cnt + 1;
+            AUDIO_PWM <= enable ? (audio_sample > pwm_cnt) : 0;
+        end
+    end
+
+    // ---------------- LED ----------------
+    reg [15:0] signal_prev;
+    reg [23:0] led2_timer;
+    reg led2_flash;
+    wire [15:0] diff = (audio_sample > signal_prev) ? (audio_sample - signal_prev) : (signal_prev - audio_sample);
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            signal_prev <= 0; led2_timer <= 0; led2_flash <= 0; LED_ALL <= 8'b0;
+        end else begin
+            signal_prev <= audio_sample;
+            if(diff > 16'd10) begin
+                led2_timer <= CLK_FREQ/4; led2_flash <= 1;
+            end else if(led2_timer > 0) led2_timer <= led2_timer - 1;
+            else led2_flash <= 0;
+
+            LED_ALL[0] <= enable;
+            LED_ALL[1] <= led2_flash;
+            LED_ALL[2] <= ~ADC_CS;
+            LED_ALL[3] <= ADC_SCK;
+            LED_ALL[4] <= audio_sample[15];
+            LED_ALL[7:5] <= 3'b000;
+        end
+    end
+
+endmodule
