@@ -1,0 +1,350 @@
+// ------------------------------
+// 1. 顶层模块（无修改，确保接口兼容）
+// ------------------------------
+`timescale 1ns / 1ps
+module top(
+    input clk,
+    input rst_n,
+    input btn_n,
+
+    // ---------- ADC SPI ----------
+    output ADC_RSTN,
+    output ADC_CS,
+    output ADC_SCK,
+    input  ADC_MISO,
+
+    // ---------- PWM 输出 ----------
+    output AUDIO_PWM,
+
+    // ---------- LED ----------
+    output [7:0] LED_ALL,
+
+    // ---------- 4x4 键盘 ----------
+    input  [3:0] Key_Row,   // 行输入：E10 C10 F9 D9
+    output [3:0] Key_Col    // 列输出：F10 C11 D11 E11
+);
+
+    // 信号线声明（保持原定义，确保与新模块兼容）
+    wire [15:0] audio_sample;
+    wire [15:0] audio_proc;
+    wire enable;
+
+    // ---------- 模块1：ADC输入（无修改） ----------
+    audio_input u_input (
+        .clk(clk),
+        .rst_n(rst_n),
+        .btn_n(btn_n),
+        .ADC_RSTN(ADC_RSTN),
+        .ADC_CS(ADC_CS),
+        .ADC_SCK(ADC_SCK),
+        .ADC_MISO(ADC_MISO),
+        .audio_sample(audio_sample),
+        .enable(enable)
+    );
+
+    // ---------- 模块2：非IIR降噪模块（滑动平均+动态阈值） ----------
+    audio_process u_proc (
+        .clk(clk),
+        .rst_n(rst_n),
+        .enable(enable),
+        .audio_in(audio_sample),  // 输入：ADC放大后的采样值
+        .audio_out(audio_proc)    // 输出：降噪后音频
+    );
+
+    // ---------- 模块3：音频输出 + 键盘控制（修复完整） ----------
+    audio_output u_output (
+        .clk(clk),
+        .rst_n(rst_n),
+        .enable(enable),
+        .audio_sample(audio_proc),   // 接降噪后的音频
+        .ADC_CS(ADC_CS),
+        .ADC_SCK(ADC_SCK),
+        .Key_Row(Key_Row),
+        .Key_Col(Key_Col),
+        .AUDIO_PWM(AUDIO_PWM),
+        .LED_ALL(LED_ALL)
+    );
+
+endmodule
+
+// ------------------------------
+// 2. ADC输入模块（无修改，保持原功能）
+// ------------------------------
+`timescale 1ns / 1ps
+module audio_input(
+    input        clk,
+    input        rst_n,
+    input        btn_n,
+    output reg   ADC_RSTN,
+    output reg   ADC_CS,
+    output reg   ADC_SCK,
+    input        ADC_MISO,
+    output reg [15:0] audio_sample,
+    output wire enable
+);
+
+    parameter CLK_FREQ = 50_000_000;
+    parameter RESET_US = 300;
+    parameter WAIT_US  = 10_000;
+    parameter SCK_FREQ = 1_000_000;
+
+    assign enable = ~btn_n;
+
+    // ---------------- ADC 初始化 ----------------
+    reg [23:0] reset_cnt;
+    reg init_done;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            ADC_RSTN <= 0; reset_cnt <= 0; init_done <= 0;
+        end else if(!init_done) begin
+            if(reset_cnt < (CLK_FREQ/1_000_000)*RESET_US) ADC_RSTN <= 0;
+            else if(reset_cnt < (CLK_FREQ/1_000_000)*(RESET_US+WAIT_US)) ADC_RSTN <= 1;
+            else init_done <= 1;
+            reset_cnt <= reset_cnt + 1;
+        end
+    end
+
+    // ---------------- SPI SCK ----------------
+    reg [5:0] sck_div;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin ADC_SCK <= 0; sck_div <= 0; end
+        else if(init_done && enable) begin
+            if(sck_div >= (CLK_FREQ/(2*SCK_FREQ)-1)) begin
+                sck_div <= 0; ADC_SCK <= ~ADC_SCK;
+            end else sck_div <= sck_div + 1;
+        end else begin ADC_SCK <= 0; sck_div <= 0; end
+    end
+
+    // ---------------- SPI 采样 ----------------
+    reg [3:0] spi_bit_cnt;
+    reg [15:0] shift_reg;
+    reg spi_busy;
+    reg [15:0] audio_sample_raw;
+
+    always @(posedge ADC_SCK or negedge rst_n) begin
+        if(!rst_n) begin
+            shift_reg <= 0; audio_sample_raw <= 0; spi_bit_cnt <= 0;
+            ADC_CS <= 1; spi_busy <= 0;
+        end else if(init_done && enable) begin
+            if(!spi_busy) begin ADC_CS <= 0; spi_busy <= 1; spi_bit_cnt <= 0; end
+            else begin
+                shift_reg <= {shift_reg[14:0], ADC_MISO};
+                spi_bit_cnt <= spi_bit_cnt + 1;
+                if(spi_bit_cnt == 11) begin
+                    audio_sample_raw <= {shift_reg[14:0], ADC_MISO};
+                    ADC_CS <= 1; spi_busy <= 0;
+                end
+            end
+        end else begin ADC_CS <= 1; spi_busy <= 0; end
+    end
+
+    // ---------------- 音频缓冲（原放大逻辑保留） ----------------
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) audio_sample <= 0;
+        else audio_sample <= audio_sample_raw << 2; // 左移2位放大
+    end
+
+endmodule
+
+// ------------------------------
+// 3. 非IIR降噪模块（滑动平均+动态阈值，无修改）
+// ------------------------------
+`timescale 1ns / 1ps
+module audio_process (
+    input  wire clk,                // 50MHz主时钟
+    input  wire rst_n,              // 异步复位（低有效）
+    input  wire enable,             // 使能信号
+    input  wire [15:0] audio_in,    // 输入：ADC放大后的采样值（16位无符号）
+    output reg  [15:0] audio_out    // 输出：降噪后的音频值（16位无符号）
+);
+
+    // 非IIR降噪核心参数
+    parameter AVG_WINDOW   = 8'd16;      // 滑动平均窗口（16个样本）
+    parameter NOISE_WINDOW = 8'd128;     // 背景噪声统计窗口（128个样本）
+    parameter NOISE_GAIN   = 4'd3;       // 噪声阈值增益（阈值=噪声均值×3）
+    parameter SAMPLE_FREQ  = 10_000;     // ADC采样频率（10kHz）
+    parameter CLK_FREQ     = 50_000_000; // 主时钟频率（50MHz）
+
+    // ---------------- 第一步：生成采样同步标志 ----------------
+    reg [12:0] sample_sync_cnt;  // 50MHz/10kHz=5000，13位计数足够
+    reg spi_sample_valid;        // 采样同步标志（每10kHz触发一次）
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            sample_sync_cnt <= 13'd0;
+            spi_sample_valid <= 1'b0;
+        end else if (enable) begin
+            if (sample_sync_cnt >= (CLK_FREQ / SAMPLE_FREQ) - 1) begin
+                sample_sync_cnt <= 13'd0;
+                spi_sample_valid <= 1'b1; // 生成采样有效脉冲
+            end else begin
+                sample_sync_cnt <= sample_sync_cnt + 1'b1;
+                spi_sample_valid <= 1'b0;
+            end
+        end else begin
+            sample_sync_cnt <= 13'd0;
+            spi_sample_valid <= 1'b0;
+        end
+    end
+
+    // ---------------- 第二步：滑动平均滤波 ----------------
+    reg [15:0] avg_filtered;  // 滑动平均滤波后的数据
+    reg [18:0] avg_acc;       // 累加器（16位×16样本=19位，避免溢出）
+    reg [7:0]  avg_cnt;       // 平均窗口计数器（0~15）
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            avg_filtered <= 16'd0;
+            avg_acc <= 19'd0;
+            avg_cnt <= 8'd0;
+        end else if (enable && spi_sample_valid) begin
+            avg_acc <= avg_acc + audio_in;
+            if (avg_cnt == AVG_WINDOW - 1) begin
+                avg_filtered <= avg_acc >> 4; // 除以16（右移4位）
+                avg_acc <= 19'd0;
+                avg_cnt <= 8'd0;
+            end else begin
+                avg_cnt <= avg_cnt + 1'b1;
+            end
+        end
+    end
+
+    // ---------------- 第三步：动态阈值噪声门限 ----------------
+    reg [15:0] noise_avg;    // 背景噪声均值
+    reg [18:0] noise_acc;    // 噪声累加器（16位×128样本=19位）
+    reg [7:0]  noise_cnt;    // 噪声窗口计数器（0~127）
+    reg [15:0] noise_thresh; // 噪声阈值（noise_avg × 3）
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            noise_avg <= 16'd0;
+            noise_acc <= 19'd0;
+            noise_cnt <= 8'd0;
+            noise_thresh <= 16'd0;
+            audio_out <= 16'd0;
+        end else if (enable) begin
+            // 1. 统计背景噪声均值
+            if (spi_sample_valid) begin
+                if (avg_filtered < noise_thresh || noise_cnt == 0) begin
+                    noise_acc <= noise_acc + avg_filtered;
+                end
+                if (noise_cnt == NOISE_WINDOW - 1) begin
+                    noise_avg <= noise_acc >> 7; // 除以128（右移7位）
+                    noise_thresh <= noise_avg * NOISE_GAIN;
+                    noise_acc <= 19'd0;
+                    noise_cnt <= 8'd0;
+                end else begin
+                    noise_cnt <= noise_cnt + 1'b1;
+                end
+            end
+
+            // 2. 噪声门限处理
+            if (avg_filtered > noise_thresh) begin
+                audio_out <= avg_filtered - noise_avg; // 减去噪声均值
+            end else begin
+                audio_out <= 16'd0; // 噪声置0
+            end
+        end else begin
+            audio_out <= 16'd0;
+        end
+    end
+
+endmodule
+
+// ------------------------------
+// 4. 音频输出+键盘控制模块（修复完整，补充缺失逻辑）
+// ------------------------------
+`timescale 1ns / 1ps
+module audio_output(
+    input clk,
+    input rst_n,
+    input enable,
+    input [15:0] audio_sample,
+    input ADC_CS,
+    input ADC_SCK,
+    input [3:0] Key_Row,
+    output reg [3:0] Key_Col,
+    output reg AUDIO_PWM,
+    output reg [7:0] LED_ALL
+);
+
+    parameter CLK_FREQ = 50_000_000;
+    parameter PWM_FREQ = 500_000;
+    parameter SCAN_FREQ = 1000; // 键盘扫描频率 1kHz
+
+    // ================= PWM部分 =================
+    reg [15:0] pwm_cnt;
+    reg [15:0] pwm_max;
+    initial pwm_max = CLK_FREQ / PWM_FREQ; // 50MHz/500kHz=100，PWM周期100个时钟
+
+    reg [15:0] scaled_sample;
+    reg [3:0] volume_level; // 1~8 音量级别（默认4级）
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            pwm_cnt <= 0;
+            AUDIO_PWM <= 0;
+        end else begin
+            // PWM计数器循环
+            if(pwm_cnt >= pwm_max - 1)
+                pwm_cnt <= 0;
+            else
+                pwm_cnt <= pwm_cnt + 1;
+
+            // 生成PWM信号（占空比=scaled_sample/pwm_max）
+            AUDIO_PWM <= (enable && (scaled_sample > pwm_cnt)) ? 1'b1 : 1'b0;
+        end
+    end
+
+    // ================= 键盘扫描 =================
+    reg [15:0] scan_div;     // 键盘扫描分频器
+    reg [1:0] col_index;     // 列索引（0~3，对应4列）
+    reg [3:0] row_state;     // 行状态缓存
+    reg [3:0] key_value;     // 按键值（1~11，对应4x4键盘）
+    reg key_valid;           // 按键有效标志
+
+    // 列驱动：循环拉低每一列（扫描频率1kHz）
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            scan_div <= 0;
+            col_index <= 0;
+            Key_Col <= 4'b1111; // 初始时所有列拉高
+        end else begin
+            // 分频计算：50MHz/(1kHz*4列)=12500，每列扫描时间250us
+            if(scan_div >= (CLK_FREQ / (SCAN_FREQ * 4)) - 1) begin
+                scan_div <= 0;
+                col_index <= col_index + 1'b1; // 切换到下一列
+            end else begin
+                scan_div <= scan_div + 1'b1;
+            end
+            // 拉低当前列（其他列拉高）
+            Key_Col <= ~(4'b0001 << col_index);
+        end
+    end
+
+    // 行检测：读取行状态，判断是否有按键按下
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            row_state <= 4'b1111;
+            key_value <= 4'd0;
+            key_valid <= 1'b0;
+        end else begin
+            row_state <= Key_Row; // 缓存当前行状态
+            key_valid <= 1'b0;    // 默认无有效按键
+
+            // 若某一行拉低（有按键按下），解析按键值
+            if(Key_Row != 4'b1111) begin
+                key_valid <= 1'b1;
+                case ({Key_Row, col_index})
+                    7'b1110_00: key_value <= 4'd1;  // 第0列第0行：1
+                    7'b1101_00: key_value <= 4'd4;  // 第0列第1行：4
+                    7'b1011_00: key_value <= 4'd7;  // 第0列第2行：7
+                    7'b0111_00: key_value <= 4'd10; // 第0列第3行：*
+                    7'b1110_01: key_value <= 4'd2;  // 第1列第0行：2
+                    7'b1101_01: key_value <= 4'd5;  // 第1列第1行：5
+                    7'b1011_01: key_value <= 4'd8;  // 第1列第2行：8
+                    7'b0111_01: key_value <= 4'd0;  // 第1列第3行：0
+                    7'b1110_10: key_value <= 4'd3;  // 第2列第0行：3
+                    7'b1101_10: key_value <= 4'd6;  // 第2列第1行：6
+                    7'b1011_10: key_value <= 4'd9;  // 第2列第2行：9
+                    7'b0111_10: key_value <= 4</doubaocanvas>
