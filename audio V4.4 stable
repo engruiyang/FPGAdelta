@@ -1,0 +1,329 @@
+`timescale 1ns / 1ps
+module top (
+    input clk,
+    input rst_n,
+    input btn_n,
+
+    // ---------- ADC SPI ----------
+    output ADC_RSTN,
+    output ADC_CS,
+    output ADC_SCK,
+    input  ADC_MISO,
+
+    // ---------- PWM 输出 ----------
+    output AUDIO_PWM,
+
+    // ---------- LED ----------
+    output [7:0] LED_ALL,
+
+    // ---------- 4x4 键盘 ----------
+    input  [3:0] Key_Row,   
+    output [3:0] Key_Col    
+);
+
+    // ---------- 信号线声明 ----------
+    wire [15:0] audio_sample;
+    wire [15:0] audio_proc;
+    wire enable;
+    wire sample_valid;
+
+    // ---------- 模块1：ADC输入 ----------
+    audio_input u_input (
+        .clk(clk),
+        .rst_n(rst_n),
+        .btn_n(btn_n),
+        .ADC_RSTN(ADC_RSTN),
+        .ADC_CS(ADC_CS),
+        .ADC_SCK(ADC_SCK),
+        .ADC_MISO(ADC_MISO),
+        .audio_sample(audio_sample),
+        .enable(enable),
+        .sample_valid(sample_valid)
+    );
+
+    // ---------- 模块2：音频处理 ----------
+    audio_process u_proc (
+        .clk(clk),
+        .rst_n(rst_n),
+        .sample_valid(sample_valid),
+        .audio_in(audio_sample),
+        .audio_out(audio_proc)
+    );
+
+    // ---------- 模块3：音频输出 + 键盘 ----------
+    audio_output u_output (
+        .clk(clk),
+        .rst_n(rst_n),
+        .enable(enable),
+        .audio_sample(audio_proc),
+        .ADC_CS(ADC_CS),
+        .ADC_SCK(ADC_SCK),
+        .Key_Row(Key_Row),
+        .Key_Col(Key_Col),
+        .AUDIO_PWM(AUDIO_PWM),
+        .LED_ALL(LED_ALL)
+    );
+
+endmodule
+
+MODULE INPUT
+`timescale 1ns / 1ps
+module audio_input(
+    input        clk,
+    input        rst_n,
+    input        btn_n,
+    output reg   ADC_RSTN,
+    output reg   ADC_CS,
+    output reg   ADC_SCK,
+    input        ADC_MISO,
+    output reg [15:0] audio_sample,
+    output reg sample_valid,
+    output wire enable
+);
+
+    parameter CLK_FREQ = 50_000_000;
+    parameter RESET_US = 300;
+    parameter WAIT_US  = 10_000;
+    parameter SCK_FREQ = 1_000_000;
+
+    assign enable = ~btn_n;
+
+    //ADC 初始化 
+    reg [23:0] reset_cnt;
+    reg init_done;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            ADC_RSTN <= 0; reset_cnt <= 0; init_done <= 0;
+        end else if(!init_done) begin
+            if(reset_cnt < (CLK_FREQ/1_000_000)*RESET_US) ADC_RSTN <= 0;
+            else if(reset_cnt < (CLK_FREQ/1_000_000)*(RESET_US+WAIT_US)) ADC_RSTN <= 1;
+            else init_done <= 1;
+            reset_cnt <= reset_cnt + 1;
+        end
+    end
+
+    // SPI SCK 
+    reg [5:0] sck_div;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin ADC_SCK <= 0; sck_div <= 0; end
+        else if(init_done && enable) begin
+            if(sck_div >= (CLK_FREQ/(2*SCK_FREQ)-1)) begin
+                sck_div <= 0; ADC_SCK <= ~ADC_SCK;
+            end else sck_div <= sck_div + 1;
+        end else begin ADC_SCK <= 0; sck_div <= 0; end
+    end
+
+    //SPI 采样
+    reg [3:0] spi_bit_cnt;
+    reg [15:0] shift_reg;
+    reg spi_busy;
+    reg [15:0] audio_sample_raw;
+
+    always @(posedge ADC_SCK or negedge rst_n) begin
+    if(!rst_n) begin
+        shift_reg <= 0;
+        audio_sample_raw <= 0;
+        spi_bit_cnt <= 0;
+        ADC_CS <= 1;
+        spi_busy <= 0;
+        sample_valid <= 0;
+    end else if(init_done && enable) begin
+        if(!spi_busy) begin
+            ADC_CS <= 0;
+            spi_busy <= 1;
+            spi_bit_cnt <= 0;
+            sample_valid <= 0;
+        end else begin
+            shift_reg <= {shift_reg[14:0], ADC_MISO};
+            spi_bit_cnt <= spi_bit_cnt + 1;
+            if(spi_bit_cnt == 11) begin
+                audio_sample_raw <= {shift_reg[14:0], ADC_MISO};
+                ADC_CS <= 1;
+                spi_busy <= 0;
+                sample_valid <= 1'b1; //  产生一个采样完成脉冲
+            end else begin
+                sample_valid <= 1'b0;
+            end
+        end
+    end else begin
+        ADC_CS <= 1;
+        spi_busy <= 0;
+        sample_valid <= 0;
+    end
+end
+
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) audio_sample <= 0;
+        else audio_sample <= audio_sample_raw << 2; // 左移放大
+    end
+
+endmodule
+
+MODULE PROC
+`timescale 1ns / 1ps
+module audio_process(
+    input             clk,
+    input             rst_n,
+    input             sample_valid,    
+    input      [15:0] audio_in,        
+    output reg [15:0] audio_out        
+);
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            audio_out <= 16'd0;
+        end else if(sample_valid) begin
+            // 直接透传，不做任何处理
+            audio_out <= audio_in;
+        end
+    end
+
+endmodule
+
+MODULE OUTPUT
+`timescale 1ns / 1ps
+module audio_output(
+    input clk,
+    input rst_n,
+    input enable,
+    input [15:0] audio_sample,
+    input ADC_CS,
+    input ADC_SCK,
+    input [3:0] Key_Row,
+    output reg [3:0] Key_Col,
+    output reg AUDIO_PWM,
+    output reg [7:0] LED_ALL
+);
+
+    parameter CLK_FREQ = 50_000_000;
+    parameter PWM_FREQ = 500_000;
+    parameter SCAN_FREQ = 1000; // 键盘扫描频率 1kHz
+
+    // PWM部分 
+    reg [15:0] pwm_cnt;
+    reg [15:0] pwm_max;
+    initial pwm_max = CLK_FREQ / PWM_FREQ;
+
+    reg [15:0] scaled_sample;
+    reg [3:0] volume_level; // 1~8 音量级别
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            pwm_cnt <= 0;
+            AUDIO_PWM <= 0;
+        end else begin
+            if(pwm_cnt >= pwm_max-1)
+                pwm_cnt <= 0;
+            else
+                pwm_cnt <= pwm_cnt + 1;
+
+            if(enable)
+                AUDIO_PWM <= (scaled_sample > pwm_cnt);
+            else
+                AUDIO_PWM <= 0;
+        end
+    end
+
+    // 键盘扫描 
+    reg [15:0] scan_div;
+    reg [1:0] col_index;
+    reg [3:0] row_state;
+    reg [3:0] key_value;
+    reg key_valid;
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            scan_div <= 0;
+            col_index <= 0;
+            Key_Col <= 4'b1111;
+        end else begin
+            if(scan_div >= (CLK_FREQ/SCAN_FREQ/4)-1) begin
+                scan_div <= 0;
+                col_index <= col_index + 1;
+            end else
+                scan_div <= scan_div + 1;
+
+            Key_Col <= ~(4'b0001 << col_index);
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            row_state <= 4'b1111;
+            key_value <= 4'd0;
+            key_valid <= 1'b0;
+        end else begin
+            row_state <= Key_Row;
+            key_valid <= 1'b0;
+            if(Key_Row != 4'b1111) begin
+                key_valid <= 1'b1;
+                case ({Key_Row, col_index})
+                    7'b1110_00: key_value <= 4'd1;
+                    7'b1101_00: key_value <= 4'd4;
+                    7'b1011_00: key_value <= 4'd7;
+                    7'b0111_00: key_value <= 4'd10; // *
+                    7'b1110_01: key_value <= 4'd2;
+                    7'b1101_01: key_value <= 4'd5;
+                    7'b1011_01: key_value <= 4'd8;
+                    7'b0111_01: key_value <= 4'd0;  // 0
+                    7'b1110_10: key_value <= 4'd3;
+                    7'b1101_10: key_value <= 4'd6;
+                    7'b1011_10: key_value <= 4'd9;
+                    7'b0111_10: key_value <= 4'd11; // #
+                    default: key_value <= 4'd15;
+                endcase
+            end
+        end
+    end
+
+    // 音量控制 
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n)
+            volume_level <= 4'd4; // 默认中音量
+        else if(key_valid && (key_value >= 4'd1 && key_value <= 4'd8))
+            volume_level <= key_value;
+    end
+
+    //音量缩放 
+    always @(*) begin
+        case(volume_level)
+            4'd1: scaled_sample = audio_sample >> 3;
+            4'd2: scaled_sample = audio_sample >> 2;
+            4'd3: scaled_sample = audio_sample >> 1;
+            4'd4: scaled_sample = audio_sample;
+            4'd5: scaled_sample = audio_sample + (audio_sample >> 1); // ×1.5
+            4'd6: scaled_sample = audio_sample << 1;                 // ×2
+            4'd7: scaled_sample = audio_sample << 2;                 // ×4
+            4'd8: scaled_sample = audio_sample << 3;                 // ×8
+            default: scaled_sample = audio_sample;
+        endcase
+    end
+
+    // LED部分
+    reg [15:0] signal_prev;
+    reg [23:0] led2_timer;
+    reg led2_flash;
+    wire [15:0] diff = (audio_sample > signal_prev) ? (audio_sample - signal_prev) : (signal_prev - audio_sample);
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            signal_prev <= 0; led2_timer <= 0; led2_flash <= 0; LED_ALL <= 8'b0;
+        end else begin
+            signal_prev <= audio_sample;
+            if(diff > 16'd10) begin
+                led2_timer <= CLK_FREQ/4; led2_flash <= 1;
+            end else if(led2_timer > 0) led2_timer <= led2_timer - 1;
+            else led2_flash <= 0;
+
+            LED_ALL[0] <= enable;
+            LED_ALL[1] <= led2_flash;
+            LED_ALL[2] <= ~ADC_CS;
+            LED_ALL[3] <= ADC_SCK;
+            LED_ALL[4] <= audio_sample[15];
+            LED_ALL[7:5] <= 3'b000; // 保留原逻辑
+        end
+    end
+
+endmodule
+
