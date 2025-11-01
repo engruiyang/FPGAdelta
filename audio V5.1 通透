@@ -1,0 +1,209 @@
+`timescale 1ns / 1ps
+// bandpass_fir_63_fixed.v
+// 63-tap symmetric FIR bandpass filter, fs ~ 50 kS/s, pass ~ 80..8000 Hz
+// Coefficients quantized to Q1.15. Pure Verilog-2001.
+
+module bandpass_fir_63(
+    input               clk,
+    input               rst_n,
+    input signed [15:0] din,
+    output reg signed [15:0] dout
+);
+    // delay line
+    reg signed [15:0] x[0:62];
+    integer i;
+
+    // wide accumulator
+    reg signed [63:0] acc;
+    reg signed [31:0] tmp_sum;
+    reg signed [15:0] coeff;
+
+    // coeffs h[0..31] (Q1.15 integers), symmetric: h[i] == h[62-i]; center = h[31]
+    function signed [15:0] get_coeff;
+        input [5:0] idx;
+        begin
+            case (idx)
+                0:  get_coeff = -17;
+                1:  get_coeff = -40;
+                2:  get_coeff = -38;
+                3:  get_coeff =  -6;
+                4:  get_coeff =  32;
+                5:  get_coeff =  36;
+                6:  get_coeff = -19;
+                7:  get_coeff = -101;
+                8:  get_coeff = -129;
+                9:  get_coeff = -47;
+                10: get_coeff =  93;
+                11: get_coeff = 148;
+                12: get_coeff =  14;
+                13: get_coeff = -238;
+                14: get_coeff = -373;
+                15: get_coeff = -199;
+                16: get_coeff = 192;
+                17: get_coeff = 437;
+                18: get_coeff = 207;
+                19: get_coeff = -410;
+                20: get_coeff = -875;
+                21: get_coeff = -630;
+                22: get_coeff = 296;
+                23: get_coeff = 1129;
+                24: get_coeff = 912;
+                25: get_coeff = -552;
+                26: get_coeff = -2206;
+                27: get_coeff = -2281;
+                28: get_coeff = 363;
+                29: get_coeff = 5122;
+                30: get_coeff = 9729;
+                31: get_coeff = 11634; // center tap
+                default: get_coeff = 16'sd0;
+            endcase
+        end
+    endfunction
+
+    // main shift-and-convolve
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i = 0; i < 63; i = i + 1) x[i] <= 16'sd0;
+            dout <= 16'sd0;
+        end else begin
+            // shift delay line
+            for (i = 62; i > 0; i = i - 1) x[i] <= x[i-1];
+            x[0] <= din;
+
+            // symmetric convolution: sum_{i=0..30} h[i]*(x[i]+x[62-i]) + h[31]*x[31]
+            acc = 64'sd0;
+            for (i = 0; i < 31; i = i + 1) begin
+                tmp_sum = x[i] + x[62 - i];
+                coeff = get_coeff(i);
+                acc = acc + (tmp_sum * coeff);
+            end
+            coeff = get_coeff(31);
+            acc = acc + (x[31] * coeff);
+
+            // scale back: coeffs in Q1.15 -> shift right 15 (arithmetic), then saturate to 16-bit
+            // Use arithmetic shift
+            // We compute temp = acc >>> 15 and then saturate
+            // Note: Verilog >>> is arithmetic shift
+            // Saturate:
+            if (acc > 64'sd36028797018963967) begin
+                // very large (unlikely), clamp positive
+                dout <= 16'sd32767;
+            end else if (acc < -64'sd36028797018963968) begin
+                dout <= -16'sd32768;
+            end else begin
+                // arithmetic shift
+                dout <= acc >>> 15;
+            end
+        end
+    end
+endmodule
+
+
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Top module: v1 (pure Verilog version, with voice-band FIR filter)
+// Human voice band 300–3400 Hz, fs ≈ 50 kS/s
+//////////////////////////////////////////////////////////////////////////////////
+
+module v1(
+    input  clk,
+    input  MISO,
+    input  sw0,
+    output SCK,
+    output CS,
+    output clk_baud,
+    output adc_rst_n,
+    output [3:0] seg_sel,
+    output [7:0] seg_led,
+    output AudioPWM
+    );
+
+    wire clk_200M;
+    reg [31:0] pll_rst_cnt = 0;
+    always @(posedge clk)
+        if (!pll_rst_cnt[15]) pll_rst_cnt <= pll_rst_cnt + 1'b1;
+
+    assign adc_rst_n = pll_rst_cnt[15];
+
+    PLL mypll(
+        .refclk(clk),
+        .reset(!pll_rst_cnt[15]),
+        .clk0_out(clk_200M)
+    );
+
+    parameter DIVCLK_CNTMAX = 39;
+
+    clock_division #(.DIVCLK_CNTMAX(DIVCLK_CNTMAX)) u_div_baud (
+        .clk_in(clk_200M),
+        .divclk(clk_baud)
+    );
+
+    reg [31:0] rst_cnt = 0;
+    always @(posedge clk)
+        if (!rst_cnt[20]) rst_cnt <= rst_cnt + 1'b1;
+
+    // ADC SPI receive
+    wire [15:0] data_out_raw;
+    spi_rx u_spi (
+        .clk_baud(clk_baud),
+        .sck(SCK),
+        .cs(CS),
+        .miso(MISO),
+        .rst_n(rst_cnt[20]),
+        .data_out(data_out_raw)
+    );
+
+    // ====== Band-pass FIR filter (pure Verilog) ======
+    wire signed [15:0] data_out_filt;
+    bandpass_fir_63 u_bp (
+        .clk(clk_baud),
+        .rst_n(rst_cnt[20]),
+        .din(data_out_raw),
+        .dout(data_out_filt)
+    );
+
+    // ====== Display section (unchanged) ======
+    parameter DIVCLK_CNTMAX_1ms = 24999;
+    wire clk_1ms;
+    clock_division #(.DIVCLK_CNTMAX(DIVCLK_CNTMAX_1ms)) u_div_1ms (
+        .clk_in(clk),
+        .divclk(clk_1ms)
+    );
+
+    Digitron4bits u_dig (
+        .clk_1K(clk_1ms),
+        .ina(data_out_filt[3:0]),
+        .inb(data_out_filt[7:4]),
+        .inc(data_out_filt[11:8]),
+        .ind(data_out_filt[15:12]),
+        .dot(3'b000),
+        .seg_sel(seg_sel),
+        .seg_led(seg_led)
+    );
+
+    // ====== PWM DAC (unchanged) ======
+    reg [11:0] AudioPWM_cnt;
+    always @(posedge clk_200M)
+        if (AudioPWM_cnt == 12'd3999)
+            AudioPWM_cnt <= 12'd0;
+        else
+            AudioPWM_cnt <= AudioPWM_cnt + 1'b1;
+
+    wire rdclk = (AudioPWM_cnt <= 12'd1999) ? 1'b0 : 1'b1;
+
+    wire [11:0] audiodata_out;
+    fifo u_fifo (
+        .rst(!rst_cnt[20]),
+        .di(data_out_filt),
+        .clkw(CS),
+        .we(1'b1),
+        .do(audiodata_out),
+        .clkr(rdclk),
+        .re(1'b1),
+        .empty_flag(),
+        .full_flag()
+    );
+
+    assign AudioPWM = (audiodata_out[11:0] < AudioPWM_cnt) ? 1'b0 : 1'b1;
+
+endmodule
