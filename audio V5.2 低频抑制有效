@@ -1,0 +1,130 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// 127-tap symmetric FIR bandpass filter for human voice
+// Sample rate ~50 kS/s, passband 300 Hz – 4 kHz, Q1.15 coefficients
+// Low-frequency wind noise suppression, high-frequency sharp noise attenuation
+//////////////////////////////////////////////////////////////////////////////////
+
+module bandpass_fir_63(
+    input               clk,
+    input               rst_n,
+    input signed [15:0] din,
+    output reg signed [15:0] dout
+);
+
+    // 127-sample delay line
+    reg signed [15:0] x[0:126];
+    integer i;
+
+    // Accumulator
+    reg signed [63:0] acc;
+    reg signed [31:0] tmp_sum;
+    reg signed [15:0] coeff;
+
+    // Coefficient function: Q1.15, symmetric, Bandpass 20–1500 Hz @ 8 kHz, Kaiser β=9
+function signed [15:0] get_coeff;
+    input [6:0] idx; // 0..63
+    begin
+        case(idx)
+            0:  get_coeff = 16'sd0;
+            1:  get_coeff = 16'sd0;
+            2:  get_coeff = 16'sd0;
+            3:  get_coeff = 16'sd0;
+            4:  get_coeff = 16'sd0;
+            5:  get_coeff = 16'sd0;
+            6:  get_coeff = 16'sd0;
+            7:  get_coeff = -16'sd1;
+            8:  get_coeff = -16'sd1;
+            9:  get_coeff = -16'sd2;
+            10: get_coeff = -16'sd3;
+            11: get_coeff = -16'sd4;
+            12: get_coeff = -16'sd6;
+            13: get_coeff = -16'sd9;
+            14: get_coeff = -16'sd12;
+            15: get_coeff = -16'sd16;
+            16: get_coeff = -16'sd21;
+            17: get_coeff = -16'sd26;
+            18: get_coeff = -16'sd31;
+            19: get_coeff = -16'sd36;
+            20: get_coeff = -16'sd40;
+            21: get_coeff = -16'sd43;
+            22: get_coeff = -16'sd43;
+            23: get_coeff = -16'sd41;
+            24: get_coeff = -16'sd35;
+            25: get_coeff = -16'sd25;
+            26: get_coeff = -16'sd10;
+            27: get_coeff = 16'sd9;
+            28: get_coeff = 16'sd32;
+            29: get_coeff = 16'sd59;
+            30: get_coeff = 16'sd89;
+            31: get_coeff = 16'sd122;
+            32: get_coeff = 16'sd158; // 中心系数
+            33: get_coeff = 16'sd122;
+            34: get_coeff = 16'sd89;
+            35: get_coeff = 16'sd59;
+            36: get_coeff = 16'sd32;
+            37: get_coeff = 16'sd9;
+            38: get_coeff = -16'sd10;
+            39: get_coeff = -16'sd25;
+            40: get_coeff = -16'sd35;
+            41: get_coeff = -16'sd41;
+            42: get_coeff = -16'sd43;
+            43: get_coeff = -16'sd43;
+            44: get_coeff = -16'sd40;
+            45: get_coeff = -16'sd36;
+            46: get_coeff = -16'sd31;
+            47: get_coeff = -16'sd26;
+            48: get_coeff = -16'sd21;
+            49: get_coeff = -16'sd16;
+            50: get_coeff = -16'sd12;
+            51: get_coeff = -16'sd9;
+            52: get_coeff = -16'sd6;
+            53: get_coeff = -16'sd4;
+            54: get_coeff = -16'sd3;
+            55: get_coeff = -16'sd2;
+            56: get_coeff = -16'sd1;
+            57: get_coeff = -16'sd1;
+            58: get_coeff = 16'sd0;
+            59: get_coeff = 16'sd0;
+            60: get_coeff = 16'sd0;
+            61: get_coeff = 16'sd0;
+            62: get_coeff = 16'sd0;
+            63: get_coeff = 16'sd0;
+            default: get_coeff = 16'sd0;
+        endcase
+    end
+endfunction
+
+
+
+    // Main shift-and-convolve
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i=0; i<127; i=i+1) x[i] <= 16'sd0;
+            dout <= 16'sd0;
+        end else begin
+            // Shift delay line
+            for (i=126; i>0; i=i-1) x[i] <= x[i-1];
+            x[0] <= din;
+
+            // Symmetric convolution
+            acc = 64'sd0;
+            for (i=0; i<63; i=i+1) begin
+                tmp_sum = x[i] + x[126-i];
+                coeff = get_coeff(i);
+                acc = acc + (tmp_sum * coeff);
+            end
+            coeff = get_coeff(63);
+            acc = acc + x[63]*coeff;
+
+            // Scale back: Q1.15 -> 16-bit
+            if (acc > 64'sd36028797018963967) 
+                dout <= 16'sd32767;
+            else if (acc < -64'sd36028797018963968)
+                dout <= -16'sd32768;
+            else
+                dout <= acc >>> 15;
+        end
+    end
+
+endmodule
