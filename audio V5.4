@@ -1,0 +1,233 @@
+`timescale 1ns / 1ps
+// anc_multi_fx_fix.v
+// Minimal-fix version of the provided ANC module.
+// - Corrects MAC to be iterative (one tap per clock) instead of accidental combinational overwrite
+// - Corrects error calculation: e = desired - y_total
+// - Updates weights in separate update states (uses previous frame's e and x samples)
+// - Outputs adaptive filter output as negative of y_total
+// NOTE: This is still a simple educational LMS implementation; for production consider NLMS,
+// fixed-point scaling review, and resource optimizations (DSP usage, BRAM for delay lines).
+
+module anc_multi_fx #(
+    parameter TAP_LOW  = 32,
+    parameter TAP_MID  = 16,
+    parameter TAP_HIGH = 8,
+    parameter signed [15:0] MU_BASE  = 16'd3,      // step-size base (signed)
+    parameter signed [15:0] LEAK     = 16'd32700   // leak factor (Q15)
+)(
+    input wire clk,
+    input wire rst_n,
+    input  wire signed [15:0] din,     // ADC 输入 (primary mic / desired)
+    output reg  signed [15:0] dout     // ANC 输出 (to speaker: -y)
+);
+
+    // delay lines (simple shift registers)
+    reg signed [15:0] x_low [0:TAP_LOW-1];
+    reg signed [15:0] x_mid [0:TAP_MID-1];
+    reg signed [15:0] x_high[0:TAP_HIGH-1];
+
+    // weights (Q15 representation suggested)
+    reg signed [15:0] w_low [0:TAP_LOW-1];
+    reg signed [15:0] w_mid [0:TAP_MID-1];
+    reg signed [15:0] w_high[0:TAP_HIGH-1];
+
+    // accumulators and temp values
+    reg signed [47:0] acc; // wide accumulator
+    reg signed [31:0] y_low, y_mid, y_high; // filter outputs (extended)
+    reg signed [31:0] y_total; // y_low + y_mid + y_high
+    reg signed [31:0] e; // error = desired - y_total
+
+    // state machine
+    reg [3:0] state;
+    localparam S_IDLE       = 4'd0;
+    localparam S_SHIFT      = 4'd1;
+    localparam S_MAC_LOW    = 4'd2;
+    localparam S_MAC_MID    = 4'd3;
+    localparam S_MAC_HIGH   = 4'd4;
+    localparam S_COMPUTE_E  = 4'd5;
+    localparam S_UPDATE_LOW = 4'd6;
+    localparam S_UPDATE_MID = 4'd7;
+    localparam S_UPDATE_HIGH= 4'd8;
+    localparam S_DONE       = 4'd9;
+
+    // loop index
+    integer i;
+    integer tap_idx;
+
+    // local copies for updates (to avoid read-modify-write hazard)
+    reg signed [15:0] x_low_reg;
+    reg signed [15:0] x_mid_reg;
+    reg signed [15:0] x_high_reg;
+
+    // small pipeline/reg to hold the desired sample used for update (d(n))
+    reg signed [15:0] d_reg;
+
+    // initialization
+    initial begin
+        state = S_IDLE;
+        for(i=0;i<TAP_LOW;i=i+1) begin x_low[i]=0; w_low[i]=0; end
+        for(i=0;i<TAP_MID;i=i+1) begin x_mid[i]=0; w_mid[i]=0; end
+        for(i=0;i<TAP_HIGH;i=i+1) begin x_high[i]=0; w_high[i]=0; end
+        dout = 16'd0;
+        acc = 0;
+        y_low = 0; y_mid = 0; y_high = 0; y_total = 0;
+        e = 0;
+    end
+
+    // main state machine: each clock performs one micro-operation (one tap multiply-add or update)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // reset
+            state <= S_IDLE;
+            dout <= 16'd0;
+            acc <= 0;
+            y_low <= 0; y_mid <= 0; y_high <= 0; y_total <= 0;
+            e <= 0;
+            d_reg <= 0;
+            tap_idx <= 0;
+            for(i=0;i<TAP_LOW;i=i+1) begin x_low[i]<=0; w_low[i]<=0; end
+            for(i=0;i<TAP_MID;i=i+1) begin x_mid[i]<=0; w_mid[i]<=0; end
+            for(i=0;i<TAP_HIGH;i=i+1) begin x_high[i]<=0; w_high[i]<=0; end
+        end else begin
+            case (state)
+                // ----- SHIFT: push new sample into all delay lines -----
+                S_IDLE, S_SHIFT: begin
+                    // shift registers: move older samples back
+                    for (i=TAP_LOW-1; i>0; i=i-1) x_low[i] <= x_low[i-1];
+                    x_low[0] <= din; // store current sample (full-band). If you want band-splitting, replace with filtered subsample
+
+                    for (i=TAP_MID-1; i>0; i=i-1) x_mid[i] <= x_mid[i-1];
+                    x_mid[0] <= din;
+
+                    for (i=TAP_HIGH-1; i>0; i=i-1) x_high[i] <= x_high[i-1];
+                    x_high[0] <= din;
+
+                    // prepare to compute MAC for low band
+                    acc <= 0;
+                    tap_idx <= 0;
+                    d_reg <= din;
+                    y_low <= 0;
+                    y_mid <= 0;
+                    y_high <= 0;
+                    state <= S_MAC_LOW;
+                end
+
+                // ----- MAC for low band (one tap per clock) -----
+                S_MAC_LOW: begin
+                    // multiply-add: acc += w_low[tap_idx] * x_low[tap_idx]
+                    acc <= acc + $signed(w_low[tap_idx]) * $signed(x_low[tap_idx]); // product is 32-bit, acc wide
+                    if (tap_idx == TAP_LOW-1) begin
+                        // finish low band
+                        // scale acc down to 32-bit y_low. Assume weights in Q15 and x in Q15 => product Q30, sum in higher bits
+                        y_low <= acc >>> 15; // adjust depending on fixed-point convention
+                        acc <= 0;
+                        tap_idx <= 0;
+                        state <= S_MAC_MID;
+                    end else begin
+                        tap_idx <= tap_idx + 1;
+                    end
+                end
+
+                // ----- MAC for mid band -----
+                S_MAC_MID: begin
+                    acc <= acc + $signed(w_mid[tap_idx]) * $signed(x_mid[tap_idx]);
+                    if (tap_idx == TAP_MID-1) begin
+                        y_mid <= acc >>> 15;
+                        acc <= 0;
+                        tap_idx <= 0;
+                        state <= S_MAC_HIGH;
+                    end else begin
+                        tap_idx <= tap_idx + 1;
+                    end
+                end
+
+                // ----- MAC for high band -----
+                S_MAC_HIGH: begin
+                    acc <= acc + $signed(w_high[tap_idx]) * $signed(x_high[tap_idx]);
+                    if (tap_idx == TAP_HIGH-1) begin
+                        y_high <= acc >>> 15;
+                        acc <= 0;
+                        // compute total output and error next
+                        state <= S_COMPUTE_E;
+                    end else begin
+                        tap_idx <= tap_idx + 1;
+                    end
+                end
+
+                // ----- compute error e = d(n) - y_total -----
+                S_COMPUTE_E: begin
+                    y_total <= y_low + y_mid + y_high; // 32-bit sums
+                    e <= $signed({d_reg,16'b0}) >>> 0 - (y_low + y_mid + y_high); 
+                    // Note: d_reg extended to match width (here simple shift by 16 bits to align Q15 convention).
+                    // You may want a different scaling depending on weight/q format.
+                    // Move to weight update stage
+                    tap_idx <= 0;
+                    state <= S_UPDATE_LOW;
+                end
+
+                // ----- weight updates (low band) -----
+                S_UPDATE_LOW: begin
+                    // update one tap per clock to avoid combinational complexity
+                    // w = leak*w - mu * e * x  (approximate LMS with leak)
+                    // Scaling: LEAK is Q15, MU_BASE small integer; the product e*x may be large, so shift appropriately
+                    // Compute leak*w term:
+                    w_low[tap_idx] <= ($signed(w_low[tap_idx]) * LEAK) >>> 15
+                                      - (($signed(MU_BASE) * e * $signed(x_low[tap_idx])) >>> 30);
+                    // the >>>30 is heuristic scaling to keep result in 16-bit; adjust as needed per fixed-point convention
+
+                    if (tap_idx == TAP_LOW-1) begin
+                        tap_idx <= 0;
+                        state <= S_UPDATE_MID;
+                    end else begin
+                        tap_idx <= tap_idx + 1;
+                    end
+                end
+
+                // ----- weight updates (mid band) -----
+                S_UPDATE_MID: begin
+                    w_mid[tap_idx] <= ($signed(w_mid[tap_idx]) * LEAK) >>> 15
+                                      - (($signed(MU_BASE) * e * $signed(x_mid[tap_idx])) >>> 30);
+
+                    if (tap_idx == TAP_MID-1) begin
+                        tap_idx <= 0;
+                        state <= S_UPDATE_HIGH;
+                    end else begin
+                        tap_idx <= tap_idx + 1;
+                    end
+                end
+
+                // ----- weight updates (high band) -----
+                S_UPDATE_HIGH: begin
+                    w_high[tap_idx] <= ($signed(w_high[tap_idx]) * LEAK) >>> 15
+                                      - (($signed(MU_BASE) * e * $signed(x_high[tap_idx])) >>> 30);
+
+                    if (tap_idx == TAP_HIGH-1) begin
+                        tap_idx <= 0;
+                        state <= S_DONE;
+                    end else begin
+                        tap_idx <= tap_idx + 1;
+                    end
+                end
+
+                S_DONE: begin
+                    // output is negative of adaptive filter output (play inverted noise)
+                    // y_total computed earlier; recompute quickly:
+                    y_total <= y_low + y_mid + y_high;
+                    // saturate to 16-bit when assigning dout
+                    // here we take (y_total >>> 0) and negate
+                    // simple saturation:
+                    reg signed [31:0] outtmp;
+                    outtmp = - (y_total);
+                    if (outtmp > 32767) dout <= 16'sd32767;
+                    else if (outtmp < -32768) dout <= -16'sd32768;
+                    else dout <= outtmp[15:0];
+                    // loop back to shift next sample
+                    state <= S_SHIFT;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
