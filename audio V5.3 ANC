@@ -1,0 +1,336 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Top module: v2_anc_system
+// 带主动降噪 + 被动降噪二选一系统
+// sw1=1 → 启动主动降噪（ANC）
+// sw1=0 → sw0=1 启动被动降噪（FIR），sw0=0 直通输出
+//////////////////////////////////////////////////////////////////////////////////
+
+module v1_anc_system(
+    input  clk,
+    input  MISO,
+    input  sw0,          // 被动降噪开关
+    input  sw1,          // 主动降噪开关
+    output SCK,
+    output CS,
+    output clk_baud,
+    output adc_rst_n,
+    output [3:0] seg_sel,
+    output [7:0] seg_led,
+    output AudioPWM,
+    output [7:0] LED
+);
+
+    // ========= 与 v1 相同的时钟与 SPI 部分 =========
+    wire clk_200M;
+    reg [31:0] pll_rst_cnt = 0;
+    always @(posedge clk)
+        if (!pll_rst_cnt[15]) pll_rst_cnt <= pll_rst_cnt + 1'b1;
+    assign adc_rst_n = pll_rst_cnt[15];
+
+    PLL mypll(
+        .refclk(clk),
+        .reset(!pll_rst_cnt[15]),
+        .clk0_out(clk_200M)
+    );
+
+    parameter DIVCLK_CNTMAX = 39;
+    clock_division #(.DIVCLK_CNTMAX(DIVCLK_CNTMAX)) u_div_baud (
+        .clk_in(clk_200M),
+        .divclk(clk_baud)
+    );
+
+    reg [31:0] rst_cnt = 0;
+    always @(posedge clk)
+        if (!rst_cnt[20]) rst_cnt <= rst_cnt + 1'b1;
+
+    wire [15:0] data_out_raw;
+    spi_rx u_spi (
+        .clk_baud(clk_baud),
+        .sck(SCK),
+        .cs(CS),
+        .miso(MISO),
+        .rst_n(rst_cnt[20]),
+        .data_out(data_out_raw)
+    );
+
+    // ========= 被动降噪模块 =========
+    wire signed [15:0] data_out_fir;
+    bandpass_fir_63 u_bp (
+        .clk(clk_baud),
+        .rst_n(rst_cnt[20]),
+        .din(data_out_raw),
+        .dout(data_out_fir)
+    );
+
+    // ========= 主动降噪模块 =========
+    wire signed [15:0] data_out_anc;
+    anc_multi_fx u_anc (
+        .clk(clk_baud),
+        .rst_n(rst_cnt[20]),
+        .din(data_out_raw),
+        .dout(data_out_anc)
+    );
+
+    // ========= MUX 选择 =========
+    wire signed [15:0] data_out_selected;
+    assign data_out_selected =
+        sw1 ? data_out_anc : (sw0 ? data_out_fir : data_out_raw);
+
+    // ========= LED 指示 =========
+    // LED[1]：ANC 状态
+    // LED[0]：FIR 状态
+    assign LED[0] = sw0;
+    assign LED[1] = sw1;
+    assign LED[7:2] = 6'b0;
+
+    // ========= 显示部分 =========
+    parameter DIVCLK_CNTMAX_1ms = 24999;
+    wire clk_1ms;
+    clock_division #(.DIVCLK_CNTMAX(DIVCLK_CNTMAX_1ms)) u_div_1ms (
+        .clk_in(clk),
+        .divclk(clk_1ms)
+    );
+
+    Digitron4bits u_dig (
+        .clk_1K(clk_1ms),
+        .ina(data_out_selected[3:0]),
+        .inb(data_out_selected[7:4]),
+        .inc(data_out_selected[11:8]),
+        .ind(data_out_selected[15:12]),
+        .dot(3'b000),
+        .seg_sel(seg_sel),
+        .seg_led(seg_led)
+    );
+
+    // ========= PWM 输出部分 =========
+    reg [11:0] AudioPWM_cnt;
+    always @(posedge clk_200M)
+        if (AudioPWM_cnt == 12'd3999)
+            AudioPWM_cnt <= 12'd0;
+        else
+            AudioPWM_cnt <= AudioPWM_cnt + 1'b1;
+
+    wire rdclk = (AudioPWM_cnt <= 12'd1999) ? 1'b0 : 1'b1;
+    wire [11:0] audiodata_out;
+    fifo u_fifo (
+        .rst(!rst_cnt[20]),
+        .di(data_out_selected),
+        .clkw(CS),
+        .we(1'b1),
+        .do(audiodata_out),
+        .clkr(rdclk),
+        .re(1'b1),
+        .empty_flag(),
+        .full_flag()
+    );
+
+    assign AudioPWM = (audiodata_out[11:0] < AudioPWM_cnt) ? 1'b0 : 1'b1;
+
+endmodule
+
+// bandpass_fir_63.v
+// 63-tap linear-phase bandpass FIR (Hamming-windowed sinc)
+// Designed for Fs=16000 Hz, passband = 100..7000 Hz
+// Coefficients are Q1.15 signed 16-bit integers.
+// Symmetry exploited: store coeff[0..31] (inclusive center at index 31).
+// NOTE: This implementation uses blocking assignments inside the clocked process
+// to perform the MAC in one clock cycle. For FPGA synthesis you will likely need
+// to pipeline the MAC or use DSP slices: resource usage may be high for a fully-parallel 63-tap MAC.
+
+`timescale 1ns / 1ps
+module bandpass_fir_63 (
+    input clk,
+    input rst_n,
+    input signed [15:0] din,   // new sample each cycle (Q1.15)
+    output reg signed [15:0] dout  // filtered output (Q1.15), saturated
+);
+
+    parameter TAPS = 63;
+    localparam HALF = 31; // number of coeffs before center (31)
+    // coefficient memory (0..HALF), center at index HALF
+    reg signed [15:0] coeff [0:HALF];
+    // shift register for samples (0..62)
+    reg signed [15:0] x [0:TAPS-1];
+    integer i;
+
+    // accumulator width: 48-bit signed to prevent overflow (safe margin)
+    reg signed [47:0] acc;
+    reg signed [47:0] acc_shifted;
+    reg signed [31:0] prod32;
+    reg signed [33:0] tmp_sum; // pair sum extended for multiplication
+    reg signed [47:0] prod_ext; // extended product for accumulation
+
+    // initialize coefficients (auto-generated)
+initial begin
+    coeff[0] = -35;
+    coeff[1] = -6;
+    coeff[2] = -59;
+    coeff[3] = 4;
+    coeff[4] = -81;
+    coeff[5] = -8;
+    coeff[6] = -82;
+    coeff[7] = -67;
+    coeff[8] = -41;
+    coeff[9] = -179;
+    coeff[10] = 28;
+    coeff[11] = -299;
+    coeff[12] = -310;
+    coeff[13] = 41;
+    coeff[14] = -384;
+    coeff[15] = -384;
+    coeff[16] = 33;
+    coeff[17] = -355;
+    coeff[18] = -179;
+    coeff[19] = 156;
+    coeff[20] = -158;
+    coeff[21] = 458;
+    coeff[22] = -121;
+    coeff[23] = -1003;
+    coeff[24] = -77;
+    coeff[25] = 1735;
+    coeff[26] = 1772;
+    coeff[27] = -3319;
+    coeff[28] = 4349;
+    coeff[29] = -20144;
+    coeff[30] = 19106;
+    coeff[31] = -14290;
+end
+
+
+    // shift register update and MAC (single-cycle, blocking)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i=0;i<TAPS;i=i+1) x[i] <= 16'sd0;
+            dout <= 16'sd0;
+            acc <= 48'sd0;
+            acc_shifted <= 48'sd0;
+        end else begin
+            // shift
+            for (i=TAPS-1;i>0;i=i-1) x[i] <= x[i-1];
+            x[0] <= din;
+
+            // compute symmetric MAC using blocking assignments
+            acc = 48'sd0;
+            for (i=0;i<HALF;i=i+1) begin
+                // pair sum: x[i] + x[TAPS-1-i]
+                tmp_sum = $signed(x[i]) + $signed(x[TAPS-1-i]); // up to 17 bits, stored in 34-bit reg for safety
+                // product: coeff[i] (Q1.15) * tmp_sum (Q1.15) -> Q2.30 (approx), store extended
+                prod_ext = $signed(coeff[i]) * tmp_sum; // 16x34 -> 50 bits but truncated/kept in 48-bit acc
+                acc = acc + prod_ext;
+            end
+            // center tap
+            prod_ext = $signed(coeff[HALF]) * $signed(x[HALF]);
+            acc = acc + prod_ext;
+
+            // scale back from Q2.30 -> Q1.15 by arithmetic right shift 15
+            acc_shifted = acc >>> 15;
+
+            // saturation to 16 bits
+            if (acc_shifted > 48'sd32767) dout <= 16'sd32767;
+            else if (acc_shifted < -48'sd32768) dout <= -16'sd32768;
+            else dout <= acc_shifted[15:0];
+        end
+    end
+endmodule
+
+`timescale 1ns / 1ps
+module anc_multi_fx #(
+    parameter TAP_LOW  = 32,
+    parameter TAP_MID  = 16,
+    parameter TAP_HIGH = 8,
+    parameter MU_BASE  = 16'd3,
+    parameter LEAK     = 16'd32700
+)(
+    input clk,
+    input rst_n,
+    input [15:0] din,          // ADC 输入
+    output reg [15:0] dout      // ANC 输出
+);
+
+    // 延时线
+    reg [15:0] x_low [0:TAP_LOW-1];
+    reg [15:0] x_mid [0:TAP_MID-1];
+    reg [15:0] x_high[0:TAP_HIGH-1];
+
+    // 权值
+    reg [15:0] w_low [0:TAP_LOW-1];
+    reg [15:0] w_mid [0:TAP_MID-1];
+    reg [15:0] w_high[0:TAP_HIGH-1];
+
+    // MAC 累加器
+    reg [31:0] acc;
+    reg [31:0] e;
+    reg [7:0] state; // 0: idle, 1: low, 2: mid, 3: high, 4: update_low, 5:update_mid,6:update_high
+    integer i;
+    reg [15:0] din_low, din_mid, din_high;
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            dout <= 16'd0;
+            state <= 0;
+            acc <= 0;
+            e <= 0;
+            for(i=0;i<TAP_LOW;i=i+1) begin x_low[i]<=0; w_low[i]<=0; end
+            for(i=0;i<TAP_MID;i=i+1) begin x_mid[i]<=0; w_mid[i]<=0; end
+            for(i=0;i<TAP_HIGH;i=i+1) begin x_high[i]<=0; w_high[i]<=0; end
+        end else begin
+            case(state)
+                0: begin
+                    // 延时线更新
+                    for(i=TAP_LOW-1;i>0;i=i-1) x_low[i]<=x_low[i-1];
+                    x_low[0]<=din >>> 1;  // 简单分频
+                    for(i=TAP_MID-1;i>0;i=i-1) x_mid[i]<=x_mid[i-1];
+                    x_mid[0]<=din >>> 1;
+                    for(i=TAP_HIGH-1;i>0;i=i-1) x_high[i]<=x_high[i-1];
+                    x_high[0]<=din >>> 1;
+                    acc<=0;
+                    state<=1;
+                end
+
+                1: begin // 低频 MAC
+                    acc <= 0;
+                    for(i=0;i<TAP_LOW;i=i+1)
+                        acc <= acc + w_low[i]*x_low[i];
+                    e <= (din>>>1) + (acc>>>15);
+                    state <= 2;
+                end
+
+                2: begin // 中频 MAC
+                    acc <= 0;
+                    for(i=0;i<TAP_MID;i=i+1)
+                        acc <= acc + w_mid[i]*x_mid[i];
+                    e <= e + ((din>>>1) + (acc>>>15));
+                    state <= 3;
+                end
+
+                3: begin // 高频 MAC
+                    acc <= 0;
+                    for(i=0;i<TAP_HIGH;i=i+1)
+                        acc <= acc + w_high[i]*x_high[i];
+                    e <= e + ((din>>>1) + (acc>>>15));
+                    state <= 4;
+                end
+
+                4: begin // 更新低频权值
+                    for(i=0;i<TAP_LOW;i=i+1)
+                        w_low[i] <= ((w_low[i]*LEAK)>>15) - ((MU_BASE*e*x_low[i])>>>15);
+                    state <= 5;
+                end
+
+                5: begin // 更新中频权值
+                    for(i=0;i<TAP_MID;i=i+1)
+                        w_mid[i] <= ((w_mid[i]*LEAK)>>15) - ((MU_BASE*e*x_mid[i])>>>15);
+                    state <= 6;
+                end
+
+                6: begin // 更新高频权值
+                    for(i=0;i<TAP_HIGH;i=i+1)
+                        w_high[i] <= ((w_high[i]*LEAK)>>15) - ((MU_BASE*e*x_high[i])>>>15);
+                    dout <= -(e>>>0); // 输出总和
+                    state <= 0;
+                end
+            endcase
+        end
+    end
+endmodule
